@@ -1,3 +1,4 @@
+use crate::auth::AuthService;
 use crate::config::schema::{DingTalkConfig, IrcConfig, QQConfig, WhatsAppConfig};
 use crate::config::{
     AutonomyConfig, BrowserConfig, ChannelsConfig, ComposioConfig, Config, DiscordConfig,
@@ -463,6 +464,7 @@ fn canonical_provider_name(provider_name: &str) -> &str {
         "grok" => "xai",
         "together" => "together-ai",
         "google" | "google-gemini" => "gemini",
+        "openai_codex" | "codex" => "openai-codex",
         _ => provider_name,
     }
 }
@@ -480,6 +482,7 @@ fn default_model_for_provider(provider: &str) -> String {
     match canonical_provider_name(provider) {
         "anthropic" => "claude-sonnet-4-5-20250929".into(),
         "openai" => "gpt-5.2".into(),
+        "openai-codex" => "gpt-5-codex".into(),
         "glm" | "zai" => "glm-5".into(),
         "minimax" => "MiniMax-M2.5".into(),
         "qwen" => "qwen-plus".into(),
@@ -554,6 +557,13 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
                 "gpt-5.2-codex".to_string(),
                 "GPT-5.2 Codex (agentic coding)".to_string(),
             ),
+        ],
+        "openai-codex" => vec![
+            (
+                "gpt-5-codex".to_string(),
+                "GPT-5 Codex (recommended)".to_string(),
+            ),
+            ("o4-mini".to_string(), "o4-mini (fallback)".to_string()),
         ],
         "venice" => vec![
             (
@@ -768,6 +778,7 @@ fn supports_live_model_fetch(provider_name: &str) -> bool {
         canonical_provider_name(provider_name),
         "openrouter"
             | "openai"
+            | "openai-codex"
             | "anthropic"
             | "groq"
             | "mistral"
@@ -880,6 +891,35 @@ fn fetch_openai_compatible_models(endpoint: &str, api_key: Option<&str>) -> Resu
     Ok(parse_openai_compatible_model_ids(&payload))
 }
 
+fn openai_codex_catalog_models() -> Vec<String> {
+    vec!["gpt-5-codex".to_string(), "o4-mini".to_string()]
+}
+
+fn fetch_openai_codex_models(api_key: Option<&str>) -> Result<Vec<String>> {
+    let Some(api_key) = api_key else {
+        return Ok(Vec::new());
+    };
+
+    match fetch_openai_compatible_models("https://api.openai.com/v1/models", Some(api_key)) {
+        Ok(models) => {
+            let filtered = normalize_model_ids(
+                models
+                    .into_iter()
+                    .filter(|id| {
+                        id.contains("codex") || id.starts_with("gpt-5") || id.starts_with("o4-")
+                    })
+                    .collect(),
+            );
+            if filtered.is_empty() {
+                Ok(openai_codex_catalog_models())
+            } else {
+                Ok(filtered)
+            }
+        }
+        Err(_) => Ok(openai_codex_catalog_models()),
+    }
+}
+
 fn fetch_openrouter_models(api_key: Option<&str>) -> Result<Vec<String>> {
     let client = build_model_fetch_client()?;
     let mut request = client.get("https://openrouter.ai/api/v1/models");
@@ -963,9 +1003,13 @@ fn fetch_ollama_models() -> Result<Vec<String>> {
     Ok(parse_ollama_model_ids(&payload))
 }
 
-fn fetch_live_models_for_provider(provider_name: &str, api_key: &str) -> Result<Vec<String>> {
+fn fetch_live_models_for_provider(
+    provider_name: &str,
+    api_key: &str,
+    auth_service: Option<&AuthService>,
+) -> Result<Vec<String>> {
     let provider_name = canonical_provider_name(provider_name);
-    let api_key = if api_key.trim().is_empty() {
+    let mut api_key = if api_key.trim().is_empty() {
         std::env::var(provider_env_var(provider_name))
             .ok()
             .or_else(|| {
@@ -982,8 +1026,26 @@ fn fetch_live_models_for_provider(provider_name: &str, api_key: &str) -> Result<
         Some(api_key.trim().to_string())
     };
 
+    if provider_name == "openai-codex" && api_key.is_none() {
+        api_key = auth_service
+            .and_then(|auth| {
+                auth.get_provider_bearer_token("openai-codex", None)
+                    .ok()
+                    .flatten()
+            })
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+    }
+
+    if provider_name == "openai-codex" && api_key.is_none() {
+        bail!(
+            "OpenAI Codex model refresh requires OAuth login. Run `zeroclaw auth login --provider openai-codex`."
+        );
+    }
+
     let models = match provider_name {
         "openrouter" => fetch_openrouter_models(api_key.as_deref())?,
+        "openai-codex" => fetch_openai_codex_models(api_key.as_deref())?,
         "openai" => {
             fetch_openai_compatible_models("https://api.openai.com/v1/models", api_key.as_deref())?
         }
@@ -1246,8 +1308,9 @@ pub fn run_models_refresh(
     }
 
     let api_key = config.api_key.clone().unwrap_or_default();
+    let auth_service = AuthService::from_config(config);
 
-    match fetch_live_models_for_provider(&provider_name, &api_key) {
+    match fetch_live_models_for_provider(&provider_name, &api_key, Some(&auth_service)) {
         Ok(models) if !models.is_empty() => {
             cache_live_models_for_provider(&config.workspace_dir, &provider_name, &models)?;
             println!(
@@ -1844,7 +1907,8 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Optio
     let mut live_options: Option<Vec<(String, String)>> = None;
 
     if supports_live_model_fetch(provider_name) {
-        let can_fetch_without_key = matches!(provider_name, "openrouter" | "ollama");
+        let can_fetch_without_key =
+            matches!(provider_name, "openrouter" | "ollama" | "openai-codex");
         let has_api_key = !api_key.trim().is_empty()
             || std::env::var(provider_env_var(provider_name))
                 .ok()
@@ -1880,7 +1944,7 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Optio
                 .interact()?;
 
             if should_fetch_now {
-                match fetch_live_models_for_provider(provider_name, &api_key) {
+                match fetch_live_models_for_provider(provider_name, &api_key, None) {
                     Ok(live_model_ids) if !live_model_ids.is_empty() => {
                         cache_live_models_for_provider(
                             workspace_dir,
@@ -2008,6 +2072,7 @@ fn provider_env_var(name: &str) -> &'static str {
         "openrouter" => "OPENROUTER_API_KEY",
         "anthropic" => "ANTHROPIC_API_KEY",
         "openai" => "OPENAI_API_KEY",
+        "openai-codex" => "OPENAI_CODEX_ACCESS_TOKEN",
         "ollama" => "OLLAMA_API_KEY",
         "venice" => "VENICE_API_KEY",
         "groq" => "GROQ_API_KEY",
@@ -4617,6 +4682,8 @@ mod tests {
         assert_eq!(canonical_provider_name("minimax-cn"), "minimax");
         assert_eq!(canonical_provider_name("zai-cn"), "zai");
         assert_eq!(canonical_provider_name("z.ai-global"), "zai");
+        assert_eq!(canonical_provider_name("codex"), "openai-codex");
+        assert_eq!(canonical_provider_name("openai_codex"), "openai-codex");
     }
 
     #[test]
@@ -4628,6 +4695,17 @@ mod tests {
 
         assert!(ids.contains(&"gpt-5.2".to_string()));
         assert!(ids.contains(&"gpt-5-mini".to_string()));
+    }
+
+    #[test]
+    fn curated_models_for_openai_codex_include_expected_catalog() {
+        let ids: Vec<String> = curated_models_for_provider("openai-codex")
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+
+        assert!(ids.contains(&"gpt-5-codex".to_string()));
+        assert!(ids.contains(&"o4-mini".to_string()));
     }
 
     #[test]
@@ -4643,6 +4721,8 @@ mod tests {
     #[test]
     fn supports_live_model_fetch_for_supported_and_unsupported_providers() {
         assert!(supports_live_model_fetch("openai"));
+        assert!(supports_live_model_fetch("openai-codex"));
+        assert!(supports_live_model_fetch("codex"));
         assert!(supports_live_model_fetch("anthropic"));
         assert!(supports_live_model_fetch("gemini"));
         assert!(supports_live_model_fetch("google"));
@@ -4834,6 +4914,11 @@ mod tests {
         assert_eq!(provider_env_var("openrouter"), "OPENROUTER_API_KEY");
         assert_eq!(provider_env_var("anthropic"), "ANTHROPIC_API_KEY");
         assert_eq!(provider_env_var("openai"), "OPENAI_API_KEY");
+        assert_eq!(
+            provider_env_var("openai-codex"),
+            "OPENAI_CODEX_ACCESS_TOKEN"
+        );
+        assert_eq!(provider_env_var("codex"), "OPENAI_CODEX_ACCESS_TOKEN");
         assert_eq!(provider_env_var("ollama"), "OLLAMA_API_KEY");
         assert_eq!(provider_env_var("xai"), "XAI_API_KEY");
         assert_eq!(provider_env_var("grok"), "XAI_API_KEY"); // alias

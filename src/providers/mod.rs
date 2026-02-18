@@ -638,8 +638,36 @@ pub fn create_routed_provider(
     model_routes: &[crate::config::ModelRouteConfig],
     default_model: &str,
 ) -> anyhow::Result<Box<dyn Provider>> {
+    create_routed_provider_with_options(
+        primary_name,
+        api_key,
+        api_url,
+        reliability,
+        model_routes,
+        default_model,
+        &ProviderRuntimeOptions::default(),
+    )
+}
+
+/// Create a RouterProvider with runtime options (auth profile override, state dir),
+/// or return a standard resilient provider when no model routes are configured.
+pub fn create_routed_provider_with_options(
+    primary_name: &str,
+    api_key: Option<&str>,
+    api_url: Option<&str>,
+    reliability: &crate::config::ReliabilityConfig,
+    model_routes: &[crate::config::ModelRouteConfig],
+    default_model: &str,
+    options: &ProviderRuntimeOptions,
+) -> anyhow::Result<Box<dyn Provider>> {
     if model_routes.is_empty() {
-        return create_resilient_provider(primary_name, api_key, api_url, reliability);
+        return create_resilient_provider_with_options(
+            primary_name,
+            api_key,
+            api_url,
+            reliability,
+            options,
+        );
     }
 
     // Collect unique provider names needed
@@ -665,7 +693,7 @@ pub fn create_routed_provider(
         let key = routed_credential.or(api_key);
         // Only use api_url for the primary provider
         let url = if name == primary_name { api_url } else { None };
-        match create_resilient_provider(name, key, url, reliability) {
+        match create_resilient_provider_with_options(name, key, url, reliability, options) {
             Ok(provider) => providers.push((name.clone(), provider)),
             Err(e) => {
                 if name == primary_name {
@@ -1006,6 +1034,27 @@ mod tests {
     fn factory_openai_codex() {
         let options = ProviderRuntimeOptions::default();
         assert!(create_provider_with_options("openai-codex", None, &options).is_ok());
+    }
+
+    #[test]
+    fn routed_provider_with_options_supports_openai_codex() {
+        let reliability = crate::config::ReliabilityConfig::default();
+        let options = ProviderRuntimeOptions {
+            auth_profile_override: Some("default".to_string()),
+            zeroclaw_dir: Some(std::path::PathBuf::from(".")),
+            secrets_encrypt: false,
+        };
+
+        let provider = create_routed_provider_with_options(
+            "openai-codex",
+            None,
+            None,
+            &reliability,
+            &[],
+            "gpt-5-codex",
+            &options,
+        );
+        assert!(provider.is_ok());
     }
 
     #[test]

@@ -983,13 +983,20 @@ pub async fn run(
         .or(config.default_model.as_deref())
         .unwrap_or("anthropic/claude-sonnet-4");
 
-    let provider: Box<dyn Provider> = providers::create_routed_provider(
+    let provider_options = providers::ProviderRuntimeOptions {
+        auth_profile_override: None,
+        zeroclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
+        secrets_encrypt: config.secrets.encrypt,
+    };
+
+    let provider: Box<dyn Provider> = providers::create_routed_provider_with_options(
         provider_name,
         config.api_key.as_deref(),
         config.api_url.as_deref(),
         &config.reliability,
         &config.model_routes,
         model_name,
+        &provider_options,
     )?;
 
     observer.record_event(&ObserverEvent::AgentStart {
@@ -1239,7 +1246,9 @@ pub async fn run(
                     continue;
                 }
                 "/clear" | "/new" => {
-                    println!("This will clear the current conversation and delete all session memory.");
+                    println!(
+                        "This will clear the current conversation and delete all session memory."
+                    );
                     println!("Core memories (long-term facts/preferences) will be preserved.");
                     print!("Continue? [y/N] ");
                     let _ = std::io::stdout().flush();
@@ -1258,10 +1267,7 @@ pub async fn run(
                     // Clear conversation and daily memory
                     let mut cleared = 0;
                     for category in [MemoryCategory::Conversation, MemoryCategory::Daily] {
-                        let entries = mem
-                            .list(Some(&category), None)
-                            .await
-                            .unwrap_or_default();
+                        let entries = mem.list(Some(&category), None).await.unwrap_or_default();
                         for entry in entries {
                             if mem.forget(&entry.key).await.unwrap_or(false) {
                                 cleared += 1;
@@ -1422,13 +1428,19 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         .default_model
         .clone()
         .unwrap_or_else(|| "anthropic/claude-sonnet-4-20250514".into());
-    let provider: Box<dyn Provider> = providers::create_routed_provider(
+    let provider_options = providers::ProviderRuntimeOptions {
+        auth_profile_override: None,
+        zeroclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
+        secrets_encrypt: config.secrets.encrypt,
+    };
+    let provider: Box<dyn Provider> = providers::create_routed_provider_with_options(
         provider_name,
         config.api_key.as_deref(),
         config.api_url.as_deref(),
         &config.reliability,
         &config.model_routes,
         &model_name,
+        &provider_options,
     )?;
 
     let hardware_rag: Option<crate::rag::HardwareRag> = config
