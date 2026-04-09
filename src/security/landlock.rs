@@ -126,10 +126,17 @@ impl LandlockSandbox {
 #[cfg(all(feature = "sandbox-landlock", target_os = "linux"))]
 impl Sandbox for LandlockSandbox {
     fn wrap_command(&self, _cmd: &mut std::process::Command) -> std::io::Result<()> {
-        // Apply Landlock restrictions before executing the command
-        // Note: This affects the current process, not the child process
-        // Child processes inherit the Landlock restrictions
-        self.apply_restrictions()
+        // `restrict_self()` affects the current process and all descendants.
+        // Applying it here would permanently tighten the parent agent runtime
+        // on every command invocation and eventually degrade execution.
+        //
+        // Until we can apply restrictions in the child pre-exec path, fail
+        // closed instead of mutating the long-lived parent process.
+        let _ = &self.workspace_dir;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "Landlock per-command wrapping is not yet supported safely; use firejail, bubblewrap, or docker backend",
+        ))
     }
 
     fn is_available(&self) -> bool {
@@ -230,5 +237,32 @@ mod tests {
                 target_os = "linux"
             ))),
         }
+    }
+
+    // ── §1.1 Landlock stub tests ──────────────────────────────
+
+    #[cfg(not(all(feature = "sandbox-landlock", target_os = "linux")))]
+    #[test]
+    fn landlock_stub_wrap_command_returns_unsupported() {
+        let sandbox = LandlockSandbox;
+        let mut cmd = std::process::Command::new("echo");
+        let result = sandbox.wrap_command(&mut cmd);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::Unsupported);
+    }
+
+    #[cfg(not(all(feature = "sandbox-landlock", target_os = "linux")))]
+    #[test]
+    fn landlock_stub_new_returns_unsupported() {
+        let result = LandlockSandbox::new();
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::Unsupported);
+    }
+
+    #[cfg(not(all(feature = "sandbox-landlock", target_os = "linux")))]
+    #[test]
+    fn landlock_stub_probe_returns_unsupported() {
+        let result = LandlockSandbox::probe();
+        assert!(result.is_err());
     }
 }

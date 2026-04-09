@@ -23,6 +23,8 @@ pub struct RouterProvider {
     providers: Vec<(String, Box<dyn Provider>)>,
     default_index: usize,
     default_model: String,
+    /// Vision support override from config (`None` = defer to providers).
+    vision_override: Option<bool>,
 }
 
 impl RouterProvider {
@@ -66,7 +68,14 @@ impl RouterProvider {
             providers,
             default_index: 0,
             default_model,
+            vision_override: None,
         }
+    }
+
+    /// Set vision support override from runtime config.
+    pub fn with_vision_override(mut self, vision_override: Option<bool>) -> Self {
+        self.vision_override = vision_override;
+        self
     }
 
     /// Resolve a model parameter to a (provider, actual_model) pair.
@@ -137,11 +146,33 @@ impl Provider for RouterProvider {
         provider.chat(request, &resolved_model, temperature).await
     }
 
+    async fn chat_with_tools(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[serde_json::Value],
+        model: &str,
+        temperature: f64,
+    ) -> anyhow::Result<ChatResponse> {
+        let (provider_idx, resolved_model) = self.resolve(model);
+        let (_, provider) = &self.providers[provider_idx];
+        provider
+            .chat_with_tools(messages, tools, &resolved_model, temperature)
+            .await
+    }
+
     fn supports_native_tools(&self) -> bool {
         self.providers
             .get(self.default_index)
             .map(|(_, p)| p.supports_native_tools())
             .unwrap_or(false)
+    }
+
+    fn supports_vision(&self) -> bool {
+        self.vision_override.unwrap_or_else(|| {
+            self.providers
+                .iter()
+                .any(|(_, provider)| provider.supports_vision())
+        })
     }
 
     async fn warmup(&self) -> anyhow::Result<()> {
@@ -381,5 +412,64 @@ mod tests {
             .unwrap();
         assert_eq!(result, "response");
         assert_eq!(mock.call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn chat_with_tools_delegates_to_resolved_provider() {
+        let mock = Arc::new(MockProvider::new("tool-response"));
+        let router = RouterProvider::new(
+            vec![(
+                "default".into(),
+                Box::new(Arc::clone(&mock)) as Box<dyn Provider>,
+            )],
+            vec![],
+            "model".into(),
+        );
+
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: "use tools".to_string(),
+        }];
+        let tools = vec![serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "shell",
+                "description": "Run shell command",
+                "parameters": {}
+            }
+        })];
+
+        // chat_with_tools should delegate through the router to the mock.
+        // MockProvider's default chat_with_tools calls chat_with_history -> chat_with_system.
+        let result = router
+            .chat_with_tools(&messages, &tools, "model", 0.7)
+            .await
+            .unwrap();
+        assert_eq!(result.text.as_deref(), Some("tool-response"));
+        assert_eq!(mock.call_count(), 1);
+        assert_eq!(mock.last_model(), "model");
+    }
+
+    #[tokio::test]
+    async fn chat_with_tools_routes_hint_correctly() {
+        let (router, mocks) = make_router(
+            vec![("fast", "fast-tool"), ("smart", "smart-tool")],
+            vec![("reasoning", "smart", "claude-opus")],
+        );
+
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: "reason about this".to_string(),
+        }];
+        let tools = vec![serde_json::json!({"type": "function", "function": {"name": "test"}})];
+
+        let result = router
+            .chat_with_tools(&messages, &tools, "hint:reasoning", 0.5)
+            .await
+            .unwrap();
+        assert_eq!(result.text.as_deref(), Some("smart-tool"));
+        assert_eq!(mocks[1].call_count(), 1);
+        assert_eq!(mocks[1].last_model(), "claude-opus");
+        assert_eq!(mocks[0].call_count(), 0);
     }
 }
