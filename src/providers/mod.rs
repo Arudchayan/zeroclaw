@@ -1366,7 +1366,9 @@ pub fn create_routed_provider(
     )
 }
 
-/// Create a routed provider using explicit runtime options.
+/// Create a RouterProvider with runtime options (auth profile override, state dir),
+/// or return a standard resilient provider when no model routes are configured.
+/// Uses explicit runtime options.
 pub fn create_routed_provider_with_options(
     primary_name: &str,
     api_key: Option<&str>,
@@ -1995,6 +1997,27 @@ mod tests {
     fn factory_openai_codex() {
         let options = ProviderRuntimeOptions::default();
         assert!(create_provider_with_options("openai-codex", None, &options).is_ok());
+    }
+
+    #[test]
+    fn routed_provider_with_options_supports_openai_codex() {
+        let reliability = crate::config::ReliabilityConfig::default();
+        let options = ProviderRuntimeOptions {
+            auth_profile_override: Some("default".to_string()),
+            zeroclaw_dir: Some(std::path::PathBuf::from(".")),
+            secrets_encrypt: false,
+        };
+
+        let provider = create_routed_provider_with_options(
+            "openai-codex",
+            None,
+            None,
+            &reliability,
+            &[],
+            "gpt-5-codex",
+            &options,
+        );
+        assert!(provider.is_ok());
     }
 
     #[test]
