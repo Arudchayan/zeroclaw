@@ -1130,6 +1130,54 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
     }
 }
 
+fn normalize_ollama_endpoint_url(raw_url: &str) -> String {
+    let trimmed = raw_url.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    trimmed
+        .strip_suffix("/api")
+        .unwrap_or(trimmed)
+        .trim_end_matches('/')
+        .to_string()
+}
+
+fn ollama_endpoint_is_local(endpoint_url: &str) -> bool {
+    reqwest::Url::parse(endpoint_url)
+        .ok()
+        .and_then(|url| url.host_str().map(|host| host.to_ascii_lowercase()))
+        .is_some_and(|host| matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1" | "0.0.0.0"))
+}
+
+fn ollama_uses_remote_endpoint(provider_api_url: Option<&str>) -> bool {
+    let Some(endpoint) = provider_api_url else {
+        return false;
+    };
+
+    let normalized = normalize_ollama_endpoint_url(endpoint);
+    !normalized.is_empty() && !ollama_endpoint_is_local(&normalized)
+}
+
+fn resolve_live_models_endpoint(
+    provider_name: &str,
+    provider_api_url: Option<&str>,
+) -> Option<String> {
+    if canonical_provider_name(provider_name) == "llamacpp" {
+        if let Some(url) = provider_api_url
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+        {
+            let normalized = url.trim_end_matches('/');
+            if normalized.ends_with("/models") {
+                return Some(normalized.to_string());
+            }
+            return Some(format!("{normalized}/models"));
+        }
+    }
+
+    models_endpoint_for_provider(provider_name).map(str::to_string)
+}
+
 fn supports_live_model_fetch(provider_name: &str) -> bool {
     if provider_name.trim().starts_with("custom:") {
         return true;
@@ -1471,23 +1519,29 @@ fn fetch_live_models_for_provider(
     let models = match provider_name {
         "openrouter" => fetch_openrouter_models(api_key.as_deref())?,
         "openai-codex" => fetch_openai_codex_models(api_key.as_deref())?,
-        "openai" => {
-            fetch_openai_compatible_models("https://api.openai.com/v1/models", api_key.as_deref(), false)?
-        }
+        "openai" => fetch_openai_compatible_models(
+            "https://api.openai.com/v1/models",
+            api_key.as_deref(),
+            false,
+        )?,
         "groq" => fetch_openai_compatible_models(
             "https://api.groq.com/openai/v1/models",
             api_key.as_deref(),
             false,
         )?,
-        "mistral" => {
-            fetch_openai_compatible_models("https://api.mistral.ai/v1/models", api_key.as_deref(), false)?
-        }
+        "mistral" => fetch_openai_compatible_models(
+            "https://api.mistral.ai/v1/models",
+            api_key.as_deref(),
+            false,
+        )?,
         "deepseek" => fetch_openai_compatible_models(
             "https://api.deepseek.com/v1/models",
             api_key.as_deref(),
             false,
         )?,
-        "xai" => fetch_openai_compatible_models("https://api.x.ai/v1/models", api_key.as_deref(), false)?,
+        "xai" => {
+            fetch_openai_compatible_models("https://api.x.ai/v1/models", api_key.as_deref(), false)?
+        }
         "together-ai" => fetch_openai_compatible_models(
             "https://api.together.xyz/v1/models",
             api_key.as_deref(),
@@ -2645,8 +2699,9 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
     if supports_live_model_fetch(provider_name) {
         let ollama_remote = canonical_provider == "ollama"
             && ollama_uses_remote_endpoint(provider_api_url.as_deref());
-        let can_fetch_without_key =
-            (allows_unauthenticated_model_fetch(provider_name) || provider_name == "openai-codex") && !ollama_remote;
+        let can_fetch_without_key = (allows_unauthenticated_model_fetch(provider_name)
+            || provider_name == "openai-codex")
+            && !ollama_remote;
         let has_api_key = !api_key.trim().is_empty()
             || ((canonical_provider != "ollama" || ollama_remote)
                 && std::env::var(provider_env_var(provider_name))
@@ -7023,7 +7078,6 @@ mod tests {
     fn provider_env_var_known_providers() {
         assert_eq!(provider_env_var("openrouter"), "OPENROUTER_API_KEY");
         assert_eq!(provider_env_var("anthropic"), "ANTHROPIC_API_KEY");
-        assert_eq!(provider_env_var("openai-codex"), "OPENAI_API_KEY");
         assert_eq!(provider_env_var("openai"), "OPENAI_API_KEY");
         assert_eq!(
             provider_env_var("openai-codex"),
